@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "paths": {
+      "#constants": ["./constants.ts"],
+      "#freebuff": ["./freebuff.ts"],
+      "#server": ["./server.ts"],
+      "#types": ["./types.ts"]
+    }
+  },
+  "include": ["*.ts"]
+}

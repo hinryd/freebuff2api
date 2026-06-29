@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "#constants": "./constants.ts",
+    "#freebuff": "./freebuff.ts",
+    "#server": "./server.ts",
+    "#types": "./types.ts"
+  }
+}
