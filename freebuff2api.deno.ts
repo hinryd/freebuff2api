@@ -1563,7 +1563,7 @@ function loadSettings(): Settings {
     clientId:
       env("FREEBUFF_CLIENT_ID") ??
       crypto.randomUUID().replace(/-/g, "").slice(0, 11),
-    adProviders: csvEnv("FREEBUFF_AD_PROVIDERS", "gravity,zeroclick"),
+    adProviders: csvEnv("FREEBUFF_AD_PROVIDERS", "gravity,carbon"),
     requestTimeoutSeconds: Number(env("FREEBUFF_TIMEOUT") ?? "60"),
     debug,
     logBodyChars: Number(
