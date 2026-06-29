@@ -737,6 +737,8 @@ type CodebuffAccount = {
 	sessions: SessionManager;
 	busy: boolean;
 	idleDeleteTimer: number | null;
+	pendingRun: FreebuffRun | null;
+	pendingRunModel: string | null;
 };
 
 class CodebuffAccountLease {
@@ -749,6 +751,21 @@ class CodebuffAccountLease {
 		private pool: CodebuffAccountPool,
 		private accountIndex: number,
 	) {}
+
+	async startOrReuseRun(
+		model: FreebuffModel,
+		isToolResultTurn: boolean,
+	): Promise<FreebuffRun> {
+		return await this.pool.startOrReuseRun(
+			this.accountIndex,
+			model,
+			isToolResultTurn,
+		);
+	}
+
+	async finishRun(run: FreebuffRun, messageId: string | null): Promise<void> {
+		await this.pool.finishRun(this.accountIndex, run, messageId);
+	}
 
 	async deleteUpstreamSession(): Promise<void> {
 		await this.pool.deleteSession(this.accountIndex);
@@ -784,6 +801,8 @@ class CodebuffAccountPool {
 				sessions: new SessionManager(client, accountSettings),
 				busy: false,
 				idleDeleteTimer: null,
+				pendingRun: null,
+				pendingRunModel: null,
 			});
 		}
 	}
@@ -820,16 +839,56 @@ class CodebuffAccountPool {
 		}
 	}
 
+	async startOrReuseRun(
+		accountIndex: number,
+		model: FreebuffModel,
+		isToolResultTurn: boolean,
+	): Promise<FreebuffRun> {
+		const account = this.accounts[accountIndex];
+		if (
+			account.pendingRun &&
+			isToolResultTurn &&
+			account.pendingRunModel === model.id
+		) {
+			return account.pendingRun;
+		}
+		if (account.pendingRun) {
+			await this.finishRun(accountIndex, account.pendingRun, null);
+		}
+		const run = await startFreebuffRunChain(account.client, model);
+		account.pendingRun = run;
+		account.pendingRunModel = model.id;
+		return run;
+	}
+
+	async finishRun(
+		accountIndex: number,
+		run: FreebuffRun,
+		messageId: string | null,
+	): Promise<void> {
+		const account = this.accounts[accountIndex];
+		await finalizeRun(account.client, run, messageId);
+		if (account.pendingRun === run) {
+			account.pendingRun = null;
+			account.pendingRunModel = null;
+		}
+	}
+
 	async deleteSession(accountIndex: number): Promise<void> {
 		const account = this.accounts[accountIndex];
 		this.clearIdleDelete(accountIndex);
 		try {
+			if (account.pendingRun) {
+				await this.finishRun(accountIndex, account.pendingRun, null);
+			}
 			await account.client.deleteSession();
 		} catch (error) {
 			console.warn(
 				`delete upstream session failed account=${accountIndex}: ${errorMessage(error)}`,
 			);
 		} finally {
+			account.pendingRun = null;
+			account.pendingRunModel = null;
 			account.sessions.clear();
 		}
 	}
@@ -1075,7 +1134,7 @@ async function chatCompletions(
 		lease = await accounts.acquireSession(sessionId(modelConfig), messages);
 		const client = lease.client;
 		await client.validateAgents();
-		run = await startFreebuffRunChain(client, modelConfig);
+		run = await lease.startOrReuseRun(modelConfig, isToolResultTurn(messages));
 		payload = buildUpstreamPayload(
 			{ ...body, messages },
 			lease.session,
@@ -1121,6 +1180,9 @@ async function chatCompletions(
 			model,
 			request.signal,
 		);
+		if (!responseNeedsToolFollowup(response)) {
+			await lease.finishRun(run, stringOrNull(response.id));
+		}
 		return jsonResponse(response);
 	} catch (error) {
 		deleteSessionAfterFinalize = true;
@@ -1157,6 +1219,7 @@ function streamOpenAIChunks(
 			let messageId: string | null = null;
 			let shouldClose = true;
 			let deleteSessionAfterFinalize = false;
+			let needsToolFollowup = false;
 			try {
 				for await (const line of client.chatEvents(
 					payload,
@@ -1169,6 +1232,7 @@ function streamOpenAIChunks(
 						break;
 					}
 					messageId = stringOrNull(data.id) ?? messageId;
+					needsToolFollowup = needsToolFollowup || chunkNeedsToolFollowup(data);
 					const chunk = sanitizeStreamChunk(data);
 					if (chunk) controller.enqueue(encodeSse(chunk));
 				}
@@ -1202,9 +1266,13 @@ function streamOpenAIChunks(
 				}
 			} finally {
 				requestSignal.removeEventListener("abort", abortFromRequest);
-				await finalizeRun(client, run, messageId);
-				if (deleteSessionAfterFinalize) await deleteAndReleaseSession(lease);
-				else lease.finishNormally();
+				if (deleteSessionAfterFinalize) {
+					await lease.finishRun(run, messageId);
+					await deleteAndReleaseSession(lease);
+				} else {
+					if (!needsToolFollowup) await lease.finishRun(run, messageId);
+					lease.finishNormally();
+				}
 				if (shouldClose) controller.close();
 			}
 		},
@@ -1223,29 +1291,24 @@ async function collectCompletion(
 ): Promise<JsonObject> {
 	let messageId: string | null = null;
 	const accumulator = new CompletionAccumulator(model);
-	try {
-		for await (const line of client.chatEvents(payload, signal)) {
-			const data = decodeSseData(line);
-			if (data === null) continue;
-			if (data === "[DONE]") break;
-			messageId = stringOrNull(data.id) ?? messageId;
-			accumulator.add(data);
-		}
-		const response = accumulator.finalResponse();
-		const choices = Array.isArray(response.choices)
-			? (response.choices as JsonObject[])
-			: [];
-		const firstChoice = choices[0] ?? {};
-		const message = isObject(firstChoice.message) ? firstChoice.message : {};
-		console.info(
-			`chat completion response run_id=${run.runId} message_id=${messageId ?? ""} content_chars=${String(message.content ?? "").length} finish_reason=${String(firstChoice.finish_reason ?? "")}`,
-		);
-		return response;
-	} finally {
-		await finalizeRun(client, run, messageId);
+	for await (const line of client.chatEvents(payload, signal)) {
+		const data = decodeSseData(line);
+		if (data === null) continue;
+		if (data === "[DONE]") break;
+		messageId = stringOrNull(data.id) ?? messageId;
+		accumulator.add(data);
 	}
+	const response = accumulator.finalResponse();
+	const choices = Array.isArray(response.choices)
+		? (response.choices as JsonObject[])
+		: [];
+	const firstChoice = choices[0] ?? {};
+	const message = isObject(firstChoice.message) ? firstChoice.message : {};
+	console.info(
+		`chat completion response run_id=${run.runId} message_id=${messageId ?? ""} content_chars=${String(message.content ?? "").length} finish_reason=${String(firstChoice.finish_reason ?? "")}`,
+	);
+	return response;
 }
-
 async function startFreebuffRunChain(
 	client: CodebuffClient,
 	model: FreebuffModel,
@@ -1341,6 +1404,32 @@ function buildUpstreamPayload(
 		cost_mode: "free",
 	};
 	return payload;
+}
+
+function isToolResultTurn(messages: ChatMessage[]): boolean {
+	return messages.some((message) => message.role === "tool");
+}
+
+function responseNeedsToolFollowup(response: JsonObject): boolean {
+	const choices = Array.isArray(response.choices)
+		? (response.choices as JsonObject[])
+		: [];
+	return choices.some((choice) => {
+		if (choice.finish_reason === "tool_calls") return true;
+		const message = isObject(choice.message) ? choice.message : {};
+		return Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+	});
+}
+
+function chunkNeedsToolFollowup(chunk: JsonObject): boolean {
+	const choices = Array.isArray(chunk.choices)
+		? (chunk.choices as JsonObject[])
+		: [];
+	return choices.some((choice) => {
+		if (choice.finish_reason === "tool_calls") return true;
+		const delta = isObject(choice.delta) ? choice.delta : {};
+		return Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
+	});
 }
 
 function normalizeChatMessages(messages: unknown): ChatMessage[] {
