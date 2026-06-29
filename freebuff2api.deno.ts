@@ -63,7 +63,6 @@ const CHAT_COMPLETIONS_USER_AGENT =
 const HAR_BROWSER_USER_AGENT =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-const CONTEXT_PRUNER_AGENT_ID = "context-pruner";
 const GEMINI_THINKER_AGENT_ID = "thinker-with-files-gemini";
 const GEMINI_THINKER_PARENT_AGENT_ID = "base2-free-kimi";
 const GEMINI_THINKER_PARENT_MODEL_ID = "moonshotai/kimi-k2.6";
@@ -628,7 +627,7 @@ class SessionManager {
 
 		const activeSession = await this.deleteLockedSession(model);
 		if (activeSession) return activeSession;
-		await this.requestAdsAndStreak(messages, "waiting_room");
+		await this.requestAdsAndStreak(null, "waiting_room");
 
 		try {
 			const session = await this.client.createSession(model);
@@ -645,7 +644,7 @@ class SessionManager {
 			);
 			await this.client.deleteSession();
 			this.sessions.clear();
-			await this.requestAdsAndStreak(messages, "waiting_room");
+			await this.requestAdsAndStreak(null, "waiting_room");
 			const session = await this.client.createSession(model);
 			this.sessions.set(model, session);
 			return session;
@@ -685,6 +684,10 @@ class SessionManager {
 				);
 			}
 		}
+	}
+
+	clear(): void {
+		this.sessions.clear();
 	}
 
 	private async deleteLockedSession(
@@ -733,6 +736,7 @@ type CodebuffAccount = {
 	client: CodebuffClient;
 	sessions: SessionManager;
 	busy: boolean;
+	idleDeleteTimer: number | null;
 };
 
 class CodebuffAccountLease {
@@ -745,6 +749,17 @@ class CodebuffAccountLease {
 		private pool: CodebuffAccountPool,
 		private accountIndex: number,
 	) {}
+
+	async deleteUpstreamSession(): Promise<void> {
+		await this.pool.deleteSession(this.accountIndex);
+	}
+
+	finishNormally(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.sessionLease.close();
+		this.pool.releaseAndScheduleIdleDelete(this.accountIndex);
+	}
 
 	close(): void {
 		if (this.closed) return;
@@ -768,6 +783,7 @@ class CodebuffAccountPool {
 				client,
 				sessions: new SessionManager(client, accountSettings),
 				busy: false,
+				idleDeleteTimer: null,
 			});
 		}
 	}
@@ -804,6 +820,32 @@ class CodebuffAccountPool {
 		}
 	}
 
+	async deleteSession(accountIndex: number): Promise<void> {
+		const account = this.accounts[accountIndex];
+		this.clearIdleDelete(accountIndex);
+		try {
+			await account.client.deleteSession();
+		} catch (error) {
+			console.warn(
+				`delete upstream session failed account=${accountIndex}: ${errorMessage(error)}`,
+			);
+		} finally {
+			account.sessions.clear();
+		}
+	}
+
+	async deleteAllSessions(): Promise<number> {
+		await Promise.all(
+			this.accounts.map((_, index) => this.deleteSession(index)),
+		);
+		return this.accounts.length;
+	}
+
+	releaseAndScheduleIdleDelete(accountIndex: number): void {
+		this.release(accountIndex);
+		this.scheduleIdleDelete(accountIndex);
+	}
+
 	release(accountIndex: number): void {
 		this.accounts[accountIndex].busy = false;
 		const next = this.waiters.shift();
@@ -814,12 +856,35 @@ class CodebuffAccountPool {
 		while (true) {
 			const index = this.nextAvailableIndex();
 			if (index !== null) {
+				this.clearIdleDelete(index);
 				this.accounts[index].busy = true;
 				this.nextIndex = (index + 1) % this.accounts.length;
 				return index;
 			}
 			await new Promise<void>((resolve) => this.waiters.push(resolve));
 		}
+	}
+
+	private scheduleIdleDelete(accountIndex: number): void {
+		this.clearIdleDelete(accountIndex);
+		this.accounts[accountIndex].idleDeleteTimer = setTimeout(
+			() => {
+				void this.deleteSessionIfIdle(accountIndex);
+			},
+			5 * 60 * 1000,
+		);
+	}
+
+	private clearIdleDelete(accountIndex: number): void {
+		const timer = this.accounts[accountIndex].idleDeleteTimer;
+		if (timer !== null) clearTimeout(timer);
+		this.accounts[accountIndex].idleDeleteTimer = null;
+	}
+
+	private async deleteSessionIfIdle(accountIndex: number): Promise<void> {
+		if (this.accounts[accountIndex].busy) return;
+		console.info(`delete idle upstream session account=${accountIndex}`);
+		await this.deleteSession(accountIndex);
 	}
 
 	private nextAvailableIndex(): number | null {
@@ -1009,7 +1074,6 @@ async function chatCompletions(
 	try {
 		lease = await accounts.acquireSession(sessionId(modelConfig), messages);
 		const client = lease.client;
-		await client.requestAdChain(messages);
 		await client.validateAgents();
 		run = await startFreebuffRunChain(client, modelConfig);
 		payload = buildUpstreamPayload(
@@ -1022,7 +1086,7 @@ async function chatCompletions(
 		);
 		debugLog(settings, "prepared upstream chat", payload);
 	} catch (error) {
-		if (lease) lease.close();
+		if (lease) await deleteAndReleaseSession(lease);
 		if (error instanceof CodebuffError) return errorResponse(error);
 		throw error;
 	}
@@ -1048,6 +1112,7 @@ async function chatCompletions(
 		);
 	}
 
+	let deleteSessionAfterFinalize = false;
 	try {
 		const response = await collectCompletion(
 			lease.client,
@@ -1058,6 +1123,7 @@ async function chatCompletions(
 		);
 		return jsonResponse(response);
 	} catch (error) {
+		deleteSessionAfterFinalize = true;
 		if (request.signal.aborted || isAbortError(error)) {
 			console.info(`chat completion cancelled model=${model}`);
 			return jsonResponse(
@@ -1068,7 +1134,8 @@ async function chatCompletions(
 		if (error instanceof CodebuffError) return errorResponse(error);
 		throw error;
 	} finally {
-		lease.close();
+		if (deleteSessionAfterFinalize) await deleteAndReleaseSession(lease);
+		else lease.finishNormally();
 	}
 }
 
@@ -1089,6 +1156,7 @@ function streamOpenAIChunks(
 		async start(controller) {
 			let messageId: string | null = null;
 			let shouldClose = true;
+			let deleteSessionAfterFinalize = false;
 			try {
 				for await (const line of client.chatEvents(
 					payload,
@@ -1108,9 +1176,11 @@ function streamOpenAIChunks(
 				if (upstreamAbort.signal.aborted || isAbortError(error)) {
 					console.info(`chat stream cancelled run_id=${run.runId}`);
 					shouldClose = false;
+					deleteSessionAfterFinalize = true;
 					return;
 				}
 				if (error instanceof CodebuffError) {
+					deleteSessionAfterFinalize = true;
 					console.warn(
 						`chat stream failed run_id=${run.runId}: ${error.message}`,
 					);
@@ -1126,13 +1196,15 @@ function streamOpenAIChunks(
 					controller.enqueue(encodeSse("[DONE]"));
 				} else {
 					shouldClose = false;
+					deleteSessionAfterFinalize = true;
 					controller.error(error);
 					return;
 				}
 			} finally {
 				requestSignal.removeEventListener("abort", abortFromRequest);
-				scheduleFinalizeRun(client, run, messageId);
-				lease.close();
+				await finalizeRun(client, run, messageId);
+				if (deleteSessionAfterFinalize) await deleteAndReleaseSession(lease);
+				else lease.finishNormally();
 				if (shouldClose) controller.close();
 			}
 		},
@@ -1181,12 +1253,7 @@ async function startFreebuffRunChain(
 	if (model.parentAgentId) return await startChildChatRunChain(client, model);
 	const startedAt = utcNowIso();
 	const runId = await client.startRun(model.agentId);
-	const childStartedAt = utcNowIso();
-	const childRunId = await client.startRun(CONTEXT_PRUNER_AGENT_ID, [runId]);
-	await client.recordRunStep(childRunId, 1, null, childStartedAt, []);
-	await client.finishRun(childRunId, 2);
-	await client.recordRunStep(runId, 1, null, startedAt, [childRunId]);
-	return { runId, agentId: model.agentId, startedAt, childRunId };
+	return { runId, agentId: model.agentId, startedAt };
 }
 
 async function startChildChatRunChain(
@@ -1209,16 +1276,14 @@ async function startChildChatRunChain(
 	};
 }
 
-function scheduleFinalizeRun(
-	client: CodebuffClient,
-	run: FreebuffRun,
-	messageId: string | null,
-): void {
-	finalizeRun(client, run, messageId).catch((error) =>
-		console.error(
-			`background finalize task failed run_id=${run.runId}: ${errorMessage(error)}`,
-		),
-	);
+async function deleteAndReleaseSession(
+	lease: CodebuffAccountLease,
+): Promise<void> {
+	try {
+		await lease.deleteUpstreamSession();
+	} finally {
+		lease.close();
+	}
 }
 
 async function finalizeRun(
@@ -1242,8 +1307,8 @@ async function finalizeRun(
 			await client.finishRun(run.runId, 2);
 			return;
 		}
-		await client.recordRunStep(run.runId, 2, messageId, run.startedAt, []);
-		await client.finishRun(run.runId, 3);
+		await client.recordRunStep(run.runId, 1, messageId, run.startedAt, []);
+		await client.finishRun(run.runId, 2);
 	} catch (error) {
 		console.warn(
 			`finalize run failed run_id=${run.runId}: ${errorMessage(error)}`,
@@ -1403,7 +1468,6 @@ function agentValidationPayload(): JsonObject {
 			modelsByAgent.set(model.agentId, model);
 		if (!spawnableByAgent.has(model.agentId))
 			spawnableByAgent.set(model.agentId, new Set());
-		spawnableByAgent.get(model.agentId)?.add(CONTEXT_PRUNER_AGENT_ID);
 		if (model.parentAgentId) {
 			if (!spawnableByAgent.has(model.parentAgentId))
 				spawnableByAgent.set(model.parentAgentId, new Set());
@@ -1416,14 +1480,6 @@ function agentValidationPayload(): JsonObject {
 			upstreamId(model),
 			`Freebuff ${upstreamId(model)}`,
 			[...(spawnableByAgent.get(model.agentId) ?? new Set())].sort(),
-		),
-	);
-	definitions.push(
-		agentDefinition(
-			CONTEXT_PRUNER_AGENT_ID,
-			DEFAULT_MODEL.id,
-			"Context Pruner",
-			[],
 		),
 	);
 	return { agentDefinitions: definitions };
