@@ -1,0 +1,32 @@
+services:
+  freebuff2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: freebuff2api-deno:local
+    restart: unless-stopped
+    ports:
+      - "${FREEBUFF_PORT:-8000}:8000"
+    environment:
+      FREEBUFF_TOKEN: ${FREEBUFF_TOKEN:?set FREEBUFF_TOKEN in .env or shell}
+      FREEBUFF_API_KEY: ${FREEBUFF_API_KEY:?set FREEBUFF_API_KEY in .env or shell}
+      FREEBUFF_API_BASE_URL: ${FREEBUFF_API_BASE_URL:-https://www.codebuff.com}
+      ZEROCLICK_BASE_URL: ${ZEROCLICK_BASE_URL:-https://zeroclick.dev}
+      FREEBUFF_AD_PROVIDERS: ${FREEBUFF_AD_PROVIDERS:-gravity,zeroclick}
+      FREEBUFF_TIMEOUT: ${FREEBUFF_TIMEOUT:-60}
+      FREEBUFF_DEBUG: ${FREEBUFF_DEBUG:-false}
+      FREEBUFF_LOG_BODY_CHARS: ${FREEBUFF_LOG_BODY_CHARS:-2000}
+      FREEBUFF_HOST: 0.0.0.0
+      FREEBUFF_PORT: 8000
+      FREEBUFF_TIMEZONE: ${FREEBUFF_TIMEZONE:-Asia/Shanghai}
+      FREEBUFF_LOCALE: ${FREEBUFF_LOCALE:-zh-CN}
+      FREEBUFF_OS: ${FREEBUFF_OS:-windows}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          wget -qO- --header="Authorization: Bearer $$FREEBUFF_API_KEY" http://127.0.0.1:8000/healthz | grep -q '"ok"'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
