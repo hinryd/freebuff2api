@@ -1570,7 +1570,7 @@ function loadSettings(): Settings {
       env("FREEBUFF_LOG_BODY_CHARS") ?? (debug ? "0" : "2000"),
     ),
     host: env("FREEBUFF_HOST") ?? "0.0.0.0",
-    port: Number(env("FREEBUFF_PORT") ?? "8000"),
+    port: Number(env("FREEBUFF_PORT") ?? "4528"),
     proxyEnabled: envBool("FREEBUFF_PROXY_ENABLED", false),
     proxyUrl: env("FREEBUFF_PROXY_URL"),
     timezone: env("FREEBUFF_TIMEZONE") ?? "Asia/Shanghai",

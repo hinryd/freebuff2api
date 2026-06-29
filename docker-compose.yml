@@ -6,7 +6,7 @@ services:
     image: freebuff2api-deno:local
     restart: unless-stopped
     ports:
-      - "${FREEBUFF_PORT:-8000}:8000"
+      - "${FREEBUFF_PORT:-4528}:4528"
     environment:
       FREEBUFF_TOKEN: ${FREEBUFF_TOKEN:?set FREEBUFF_TOKEN in .env or shell}
       FREEBUFF_API_KEY: ${FREEBUFF_API_KEY:?set FREEBUFF_API_KEY in .env or shell}
@@ -25,7 +25,7 @@ services:
       test:
         - CMD-SHELL
         - |
-          wget -qO- --header="Authorization: Bearer $$FREEBUFF_API_KEY" http://127.0.0.1:8000/healthz | grep -q '"ok"'
+          wget -qO- --header="Authorization: Bearer $$FREEBUFF_API_KEY" http://127.0.0.1:4528/healthz | grep -q '"ok"'
       interval: 30s
       timeout: 5s
       retries: 3
